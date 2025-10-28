@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "can-replay"
+version = "0.1.0"
+description = "Replay CAN log request/response pairs over ISO-TP using socketcan"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Proprietary"}
+authors = [
+  { name = "can-replay" }
+]
+dependencies = []
+
+[project.scripts]
+can-replay = "can_replay.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["can_replay*"]
+
