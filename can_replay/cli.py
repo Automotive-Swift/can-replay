@@ -72,6 +72,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 
 def main(argv: List[str] | None = None) -> int:
+    # Work with a stable argv list so we can decide on help behavior
+    raw_argv: List[str] = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="can-replay", description="Replay ISO-TP replies from a CAN log")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -109,7 +111,12 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors in logs")
     add_common(parser)
 
-    args = parser.parse_args(argv)
+    # If no arguments at all, show full usage instead of a terse error
+    if len(raw_argv) == 0:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args(raw_argv)
     if args.cmd is None:
         # act like replay
         return cmd_replay(args)
