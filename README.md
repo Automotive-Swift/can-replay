@@ -1,3 +1,14 @@
+Replay tools for automated vehicle tests
+========================================
+
+These utilities let you capture real ECUs or infotainment traffic once and replay the exact responses later. They are handy for regression testing diagnostic scripts, keeping automated integration rigs deterministic, or mocking hard-to-access vehicle modules without booting the entire vehicle network.
+
+Motivation
+----------
+- Replace flaky test benches with deterministic request/response playback.
+- Verify ECU flashers, diagnostics, or telematics flows without generating real bus traffic.
+- Feed simulated clients (Telnet, TCP, or ISO-TP) with recorded answers while you iterate on tooling.
+
 can-replay
 ==========
 
@@ -29,6 +40,10 @@ Basic usage
      `can-replay build-index --log vehical_patchv2_log.TXT --pair 0x7E0:0x7E8 -o mapping.json`
   2) Run responder from mapping:
      `can-replay replay -i can0 --mapping mapping.json`
+- Drill into logged data:
+  `can-replay build-index --log vehical_patchv2_log.TXT --pair 0x7E0:0x7E8 --time-window 1.5 -o uds_mapping.json`
+- Replay with deterministic timing:
+  `can-replay replay --mapping uds_mapping.json --honor-timing -v`
 
 Flags
 - `--pair REQ:RESP`  Hex IDs for request and reply. Repeatable.
@@ -52,3 +67,38 @@ Behavioral notes
 - Logs that start with responses or mid-ISO-TP sequences are ignored for pairing and indexing; only complete reassembled PDUs are used.
 - During replay, unmatched requests are logged (when `-v` is enabled) and no reply is sent.
  - When a request maps to multiple responses (e.g., one or more NRC 7F .. 78 followed by a final response), the tool sends the sequence. With `--honor-timing`, inter-response delays match the log.
+
+enet-replay
+===========
+
+A companion CLI that replays TCP replies based on a captured pcap/pcapng conversation. It analyzes requester/responder IP pairs and replays the recorded responses over a normal TCP socket.
+
+Features
+- Parse pcap/pcapng using scapy and extract TCP payload exchanges.
+- Build request payload → sequence of response payloads per requester/responder IP pair.
+- Serve the recorded replies from a configurable TCP listening address with optional timing preservation.
+- Cycle through multiple recorded sequences for the same request (or exhaust once).
+- Colored verbose logs matching requests to responses.
+
+Requirements
+- Python 3.9+
+- scapy (installed automatically via `pip install -e .`)
+- A TCP capture containing the conversation you wish to replay.
+
+Basic usage
+- Build mapping JSON from capture:
+  `enet-replay build-index --pcap capture.pcapng --pair 192.168.0.100:192.168.0.200 -o tcp_mapping.json`
+
+- Run TCP reply server directly from capture:
+  `enet-replay --pcap capture.pcapng --listen 0.0.0.0:502 --pair 192.168.0.100:192.168.0.200`
+
+- Or replay from a saved mapping:
+  `enet-replay replay --mapping tcp_mapping.json --listen 0.0.0.0:502 -v`
+- Craft ad-hoc sequences for quick tests:
+  1) Create `hello.json` with sample request/response pairs.
+  2) `enet-replay replay --mapping hello.json --listen 127.0.0.1:2323 -v`
+  3) Connect via Telnet and send `hello` to cycle through the canned replies.
+- Build and replay in one command:
+  `enet-replay --pcap ~/Downloads/vehical_tcp.pcapng --listen [::]:8000 --exhaust`
+
+Flags mirror the CAN tool where possible (`--pair`, `--time-window`, `--exhaust`, `--honor-timing`, etc.). For IPv6 endpoints, use `@` to specify ports (e.g., `[fe80::1]@502`). If no `--pair` is provided, the tool attempts to detect requesters and responders heuristically from the capture.

@@ -12,12 +12,14 @@ license = {text = "Proprietary"}
 authors = [
   { name = "can-replay" }
 ]
-dependencies = []
+dependencies = [
+  "scapy>=2.5.0"
+]
 
 [project.scripts]
 can-replay = "can_replay.cli:main"
+enet-replay = "tcp_replay.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["can_replay*"]
-
+include = ["can_replay*", "tcp_replay*"]
