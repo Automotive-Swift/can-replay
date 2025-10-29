@@ -93,5 +93,34 @@ class ReplyEvent:
 
 
 PairKey = Tuple[str, Optional[int], str, Optional[int]]
+
+
+@dataclass(frozen=True)
+class UdpDatagram:
+    ts: float
+    src_ip: str
+    src_port: int
+    dst_ip: str
+    dst_port: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class UdpPreamble:
+    pair_key: PairKey
+    listen_port: int
+    request_payload: bytes
+    response_payload: bytes
+    dt: float
+    request_dst_ip: str
+    response_src_ip: str
+
+
 Mapping = Dict[PairKey, Dict[bytes, List[List[ReplyEvent]]]]
 
+
+@dataclass
+class MappingBundle:
+    requests: Mapping
+    udp_preambles: List[UdpPreamble]
+    tcp_ports: Dict[PairKey, Tuple[int, int]]

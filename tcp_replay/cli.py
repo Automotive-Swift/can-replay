@@ -6,9 +6,9 @@ import sys
 from typing import List, Optional, Sequence, Tuple
 
 from .indexer import build_index, detect_pairs, load_mapping, save_mapping
-from .pcap_parser import load_tcp_segments
+from .pcap_parser import load_capture
 from .server import TcpReplayServer
-from .types import Mapping, Pair, PairKey, TcpSegment
+from .types import MappingBundle, Pair, PairKey
 
 
 def parse_endpoint(text: str) -> Tuple[str, Optional[int]]:
@@ -48,7 +48,9 @@ def parse_pair(text: str) -> Pair:
     return Pair(req_ip=req_host, resp_ip=resp_host, req_port=req_port, resp_port=resp_port)
 
 
-def parse_listen(value: str) -> Tuple[str, int]:
+def parse_listen(value: Optional[str], default_port: int = 5000) -> Tuple[str, int]:
+    if value is None:
+        return "0.0.0.0", default_port
     value = value.strip()
     if not value:
         raise argparse.ArgumentTypeError("Empty listen address")
@@ -87,7 +89,7 @@ def _format_pair_list(pairs: Sequence[Pair]) -> str:
 
 def cmd_build_index(args: argparse.Namespace) -> int:
     try:
-        segments = load_tcp_segments(args.pcap)
+        segments, udp_datagrams = load_capture(args.pcap)
     except RuntimeError as exc:
         print(f"Error loading capture: {exc}", file=sys.stderr)
         return 2
@@ -98,35 +100,50 @@ def cmd_build_index(args: argparse.Namespace) -> int:
     if not pairs:
         print("No pairs detected; please provide --pair.", file=sys.stderr)
         return 2
-    mapping = build_index(segments, pairs, time_window=args.time_window)
+    bundle = build_index(segments, pairs, udp_datagrams=udp_datagrams, time_window=args.time_window)
     output = args.output or "tcp_mapping.json"
-    save_mapping(mapping, output)
-    total_requests = sum(len(reqs) for reqs in mapping.values())
-    print(f"Saved mapping to {output} with {total_requests} unique request payloads across {_format_pair_list(pairs)}")
+    save_mapping(bundle, output)
+    total_requests = sum(len(reqs) for reqs in bundle.requests.values())
+    oriented_pairs = [pair_from_key(key) for key in bundle.requests.keys()]
+    print(
+        f"Saved mapping to {output} with {total_requests} unique request payloads across {_format_pair_list(oriented_pairs)}"
+    )
+    if bundle.udp_preambles:
+        for pre in bundle.udp_preambles:
+            pair = pair_from_key(pre.pair_key)
+            print(
+                f"Detected UDP discovery preamble for {pair.to_string()} "
+                f"on port {pre.listen_port} (dst {pre.request_dst_ip})."
+            )
+    if bundle.tcp_ports:
+        for pair_key, ports in bundle.tcp_ports.items():
+            pair = pair_from_key(pair_key)
+            print(
+                f"Captured TCP ports for {pair.to_string()}: client {ports[0]} → server {ports[1]}"
+            )
     return 0
 
 
-def _filter_mapping(mapping: Mapping, pairs: List[Pair]) -> Mapping:
+def _filter_bundle(bundle: MappingBundle, pairs: List[Pair]) -> MappingBundle:
     if not pairs:
-        return mapping
-    filtered: Mapping = {}
+        return bundle
     keys = {pair.key for pair in pairs}
-    for key, reqmap in mapping.items():
-        if key in keys:
-            filtered[key] = reqmap
-    return filtered
+    filtered_requests = {key: reqmap for key, reqmap in bundle.requests.items() if key in keys}
+    filtered_preambles = [pre for pre in bundle.udp_preambles if pre.pair_key in keys]
+    filtered_ports = {key: bundle.tcp_ports[key] for key in keys if key in bundle.tcp_ports}
+    return MappingBundle(requests=filtered_requests, udp_preambles=filtered_preambles, tcp_ports=filtered_ports)
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
     if args.mapping:
-        mapping = load_mapping(args.mapping)
-        pairs = [pair_from_key(key) for key in mapping.keys()]
+        bundle = load_mapping(args.mapping)
+        available_pairs = [pair_from_key(key) for key in bundle.requests.keys()]
     else:
         if not args.pcap:
             print("Either --mapping or --pcap must be provided.", file=sys.stderr)
             return 2
         try:
-            segments = load_tcp_segments(args.pcap)
+            segments, udp_datagrams = load_capture(args.pcap)
         except RuntimeError as exc:
             print(f"Error loading capture: {exc}", file=sys.stderr)
             return 2
@@ -134,21 +151,55 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print("No TCP segments with payload found in capture.", file=sys.stderr)
             return 2
         auto_pairs = detect_pairs(segments) if not args.pair else []
-        pairs = _ensure_pairs(args.pair, auto_pairs)
-        mapping = build_index(segments, pairs, time_window=args.time_window)
-    if args.pair:
-        pairs = list(args.pair)
-        mapping = _filter_mapping(mapping, pairs)
-    if not pairs:
+        requested_pairs = _ensure_pairs(args.pair, auto_pairs)
+        bundle = build_index(segments, requested_pairs, udp_datagrams=udp_datagrams, time_window=args.time_window)
+        available_pairs = [pair_from_key(key) for key in bundle.requests.keys()]
+    if args.pair and args.mapping:
+        selected = [pair for pair in args.pair if pair.key in bundle.requests]
+        if not selected:
+            print("Requested --pair filters do not match any mapping entries.", file=sys.stderr)
+            return 2
+        bundle = _filter_bundle(bundle, selected)
+        available_pairs = selected
+    elif not available_pairs:
         print("No pairs available for replay.", file=sys.stderr)
         return 2
-    host, port = parse_listen(args.listen)
+
+    if not bundle.requests:
+        print("Mapping contains no request/response data.", file=sys.stderr)
+        return 2
+
+    if bundle.udp_preambles:
+        for pre in bundle.udp_preambles:
+            pair = pair_from_key(pre.pair_key)
+            print(
+                f"UDP discovery listener armed for {pair.to_string()} "
+                f"on port {pre.listen_port} (dst {pre.request_dst_ip})."
+            )
+    recommended_port = None
+    for pair in available_pairs:
+        ports = bundle.tcp_ports.get(pair.key)
+        if ports:
+            recommended_port = ports[1]
+            break
+
+    if args.listen is None and recommended_port is not None:
+        host, port = "0.0.0.0", recommended_port
+    else:
+        host, port = parse_listen(args.listen, default_port=recommended_port or 5000)
+        if recommended_port is not None and port != recommended_port:
+            print(
+                f"Note: mapping server port is {recommended_port}. Current listen port is {port}; "
+                f"use --listen 0.0.0.0:{recommended_port} (or your preferred host) for fidelity."
+            )
     color = None if not getattr(args, "no_color", False) else False
     server = TcpReplayServer(
         host=host,
         port=port,
-        pairs=pairs,
-        mapping=mapping,
+        pairs=available_pairs,
+        mapping=bundle.requests,
+        udp_preambles=bundle.udp_preambles,
+        udp_override_src_ip=args.udp_src_ip,
         cycle=not args.exhaust,
         verbose=bool(args.verbose),
         color=color,
@@ -180,19 +231,20 @@ def main(argv: List[str] | None = None) -> int:
     p_replay = sub.add_parser("replay", help="Run TCP reply server")
     p_replay.add_argument("--pcap", help="If provided, build mapping from this capture before replay")
     p_replay.add_argument("--mapping", help="Path to pre-built mapping JSON")
-    p_replay.add_argument("--listen", default="0.0.0.0:5000", help="Listen address host:port (default: 0.0.0.0:5000)")
+    p_replay.add_argument("--listen", help="Listen address host:port (default: capture server port)")
     p_replay.add_argument("--exhaust", action="store_true", help="Do not cycle replies; stop after last sequence")
     p_replay.add_argument("--honor-timing", action="store_true", help="Honor timing offsets from capture when sending responses")
     p_replay.add_argument("--inter-delay", type=float, default=0.02, help="Inter-response delay when not honoring timing (seconds)")
     p_replay.add_argument("-v", "--verbose", action="store_true", help="Verbose colored request/match logs")
     p_replay.add_argument("--no-color", action="store_true", help="Disable ANSI colors in logs")
+    p_replay.add_argument("--udp-src-ip", help="Override discovery reply source IP (defaults to recorded IP)")
     add_common(p_replay)
     p_replay.set_defaults(func=cmd_replay)
 
     # Convenience without subcommand defaults to replay
     parser.add_argument("--pcap", help="If provided, build mapping from this capture before replay")
     parser.add_argument("--mapping", help="Path to pre-built mapping JSON")
-    parser.add_argument("--listen", default="0.0.0.0:5000", help="Listen address host:port (default: 0.0.0.0:5000)")
+    parser.add_argument("--listen", help="Listen address host:port (default: capture server port)")
     parser.add_argument("--exhaust", action="store_true", help="Do not cycle replies; stop after last sequence")
     parser.add_argument("--honor-timing", action="store_true", help="Honor timing offsets from capture when sending responses")
     parser.add_argument("--inter-delay", type=float, default=0.02, help="Inter-response delay when not honoring timing (seconds)")

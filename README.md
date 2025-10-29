@@ -79,6 +79,8 @@ Features
 - Serve the recorded replies from a configurable TCP listening address with optional timing preservation.
 - Cycle through multiple recorded sequences for the same request (or exhaust once).
 - Colored verbose logs matching requests to responses.
+- Detect UDP discovery preambles (broadcast/multicast) that precede the TCP session and replay the discovery replies automatically.
+- Preserve the recorded responder/source IP so clients can immediately connect to the replay host, with optional raw-packet spoofing when run with the necessary privileges.
 
 Requirements
 - Python 3.9+
@@ -100,5 +102,13 @@ Basic usage
   3) Connect via Telnet and send `hello` to cycle through the canned replies.
 - Build and replay in one command:
   `enet-replay --pcap ~/Downloads/vehical_tcp.pcapng --listen [::]:8000 --exhaust`
+
+When a UDP discovery preamble is found, the CLI prints which port and pair were detected, and the replay process enables a UDP listener alongside the TCP server. Point your discovery probe (e.g., broadcast or multicast ping) at the recorded port and the tool will answer with the captured payload before continuing the TCP conversation.
+
+Tips
+- The `build-index` command prints the client→server TCP ports captured for each pair. Run the replay server on the same server port (e.g., `--listen 0.0.0.0:6801`) so downstream clients connect successfully.
+- Some discovery protocols expect the response to originate from the recorded ECU IP (e.g., a link-local address that is not configured on your host). Run the replay as root (or capture/forge packets with the necessary privileges) so the UDP responder can spoof the source IP, or manually assign an alias IP to your interface before starting `enet-replay`.
+- If you cannot spoof the recorded IP, pass `--udp-src-ip <your_host_ip>` so discovery replies advertise an address your machine actually owns.
+- If you need to force the announcer IP, you can edit the generated `tcp_mapping.json` preamble section or provide your own mapping file that matches your test environment.
 
 Flags mirror the CAN tool where possible (`--pair`, `--time-window`, `--exhaust`, `--honor-timing`, etc.). For IPv6 endpoints, use `@` to specify ports (e.g., `[fe80::1]@502`). If no `--pair` is provided, the tool attempts to detect requesters and responders heuristically from the capture.

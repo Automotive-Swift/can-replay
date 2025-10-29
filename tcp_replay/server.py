@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+import struct
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .term import VLogger
-from .types import Mapping, Pair, PairKey, ReplyEvent
+from .types import Mapping, Pair, PairKey, ReplyEvent, UdpPreamble
+
+try:
+    from scapy.all import IP, UDP, Raw, send
+except ImportError:  # pragma: no cover - optional
+    send = None
 
 
 class _RequestMatcher:
@@ -44,6 +51,68 @@ class _ClientState:
     buffer: bytearray = field(default_factory=bytearray)
 
 
+class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
+    def __init__(
+        self,
+        preamble: UdpPreamble,
+        pair_label: str,
+        log: VLogger,
+        honor_timing: bool,
+        override_src_ip: Optional[str] = None,
+    ):
+        self.preamble = preamble
+        self.pair_label = pair_label
+        self.log = log
+        self.honor_timing = honor_timing
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.override_src_ip = override_src_ip
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+        self.log.note(
+            f"UDP discovery listener ready on port {self.preamble.listen_port} for {self.pair_label}"
+        )
+
+    def datagram_received(self, data: bytes, addr) -> None:  # type: ignore[override]
+        if data != self.preamble.request_payload:
+            return
+        loop = asyncio.get_running_loop()
+
+        async def send_response() -> None:
+            if self.honor_timing and self.preamble.dt > 0:
+                await asyncio.sleep(self.preamble.dt)
+            if isinstance(addr, tuple):
+                host = addr[0]
+                port = addr[1] if len(addr) > 1 else None
+            else:
+                host, port = str(addr), None
+            sent_with_scapy = False
+            send_src_ip = self.override_src_ip or self.preamble.response_src_ip
+            if send is not None and port is not None and send_src_ip:
+                try:
+                    pkt = IP(src=send_src_ip, dst=host) / UDP(
+                        sport=self.preamble.listen_port,
+                        dport=port,
+                    ) / Raw(load=self.preamble.response_payload)
+                    send(pkt, verbose=False)
+                    sent_with_scapy = True
+                except Exception as exc:  # pragma: no cover - raw send failure
+                    self.log.warn(
+                        f"UDP discovery {self.pair_label} raw send failed ({exc}); falling back to socket"
+                    )
+            if not sent_with_scapy:
+                if self.transport is None:
+                    return
+                self.transport.sendto(self.preamble.response_payload, addr)
+            port_repr = port if port is not None else "?"
+            self.log.ok(
+                f"UDP discovery {self.pair_label} matched from {host}:{port_repr} "
+                f"→ sent {len(self.preamble.response_payload)} bytes"
+            )
+
+        loop.create_task(send_response())
+
+
 class TcpReplayServer:
     def __init__(
         self,
@@ -51,6 +120,8 @@ class TcpReplayServer:
         port: int,
         pairs: List[Pair],
         mapping: Mapping,
+        udp_preambles: Optional[List[UdpPreamble]] = None,
+        udp_override_src_ip: Optional[str] = None,
         cycle: bool = True,
         verbose: bool = False,
         color: bool | None = None,
@@ -61,6 +132,8 @@ class TcpReplayServer:
         self.port = port
         self.pairs = pairs
         self.mapping = mapping
+        self.udp_preambles = list(udp_preambles or [])
+        self.udp_override_src_ip = udp_override_src_ip
         self.cycle = cycle
         self.honor_timing = honor_timing
         self.inter_delay = inter_delay
@@ -69,6 +142,8 @@ class TcpReplayServer:
         self.lock = asyncio.Lock()
         self.matchers: Dict[PairKey, _RequestMatcher] = {}
         self.pair_by_key: Dict[PairKey, Pair] = {pair.key: pair for pair in pairs}
+        self.udp_transports: List[asyncio.DatagramTransport] = []
+        self.udp_protocols: List['_UdpDiscoveryProtocol'] = []
         for pair in pairs:
             reqmap = mapping.get(pair.key)
             if not reqmap:
@@ -76,6 +151,8 @@ class TcpReplayServer:
             self.matchers[pair.key] = _RequestMatcher(reqmap)
 
     async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        await self._start_udp_listeners(loop)
         server = await asyncio.start_server(self._handle_client, self.host, self.port)
         sockets = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
         self.log.note(f"Starting TCP replay on {sockets} for pairs: " + ", ".join(p.to_string() for p in self.pairs))
@@ -87,6 +164,7 @@ class TcpReplayServer:
         finally:
             server.close()
             await server.wait_closed()
+            self._stop_udp_listeners()
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -201,3 +279,68 @@ class TcpReplayServer:
     def _pair_string(self, pair_key: PairKey) -> str:
         pair = self.pair_by_key.get(pair_key)
         return pair.to_string() if pair else str(pair_key)
+
+    async def _start_udp_listeners(self, loop: asyncio.AbstractEventLoop) -> None:
+        if not self.udp_preambles:
+            return
+        for pre in self.udp_preambles:
+            try:
+                sock = self._make_udp_socket(pre)
+            except OSError as exc:
+                self.log.err(f"Unable to bind UDP listener on port {pre.listen_port}: {exc}")
+                continue
+            try:
+                transport, protocol = await loop.create_datagram_endpoint(
+                    lambda pre=pre: _UdpDiscoveryProtocol(
+                        pre,
+                        self._pair_string(pre.pair_key),
+                        self.log,
+                        self.honor_timing,
+                        override_src_ip=self.udp_override_src_ip,
+                    ),
+                    sock=sock,
+                )
+                self.udp_transports.append(transport)
+                self.udp_protocols.append(protocol)
+            except Exception as exc:
+                self.log.err(f"Failed to start UDP discovery listener on port {pre.listen_port}: {exc}")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _stop_udp_listeners(self) -> None:
+        for transport in self.udp_transports:
+            try:
+                transport.close()
+            except Exception:
+                pass
+        self.udp_transports.clear()
+        self.udp_protocols.clear()
+
+    def _make_udp_socket(self, pre: UdpPreamble) -> socket.socket:
+        ipv6 = ":" in pre.request_dst_ip
+        family = socket.AF_INET6 if ipv6 else socket.AF_INET
+        bind_addr = ("::", pre.listen_port) if ipv6 else ("0.0.0.0", pre.listen_port)
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if not ipv6:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(bind_addr)
+        if not ipv6 and _is_ipv4_multicast(pre.request_dst_ip):
+            try:
+                mreq = struct.pack("=4s4s", socket.inet_aton(pre.request_dst_ip), socket.inet_aton("0.0.0.0"))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except OSError:
+                pass
+        return sock
+
+
+def _is_ipv4_multicast(ip: str) -> bool:
+    if not ip:
+        return False
+    try:
+        first = int(ip.split(".", 1)[0])
+        return 224 <= first <= 239
+    except (ValueError, IndexError):
+        return False
